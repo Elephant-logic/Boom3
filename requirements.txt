@@ -6,6 +6,8 @@ openai>=1.3.5
 # Web UI
 flask>=3.0.0
 flask-sock>=0.7.0
+gunicorn>=21.2.0
+gevent>=23.0.0
 
 # Auth / rate limiting (required for production)
 flask-limiter>=3.5.0
@@ -25,6 +27,3 @@ pillow>=10.0.0
 # Utilities
 requests>=2.31.0
 python-dotenv>=1.0.0
-
-# Production WSGI server for Render
-gunicorn>=22.0.0

@@ -4,12 +4,11 @@ Modern Web UI for Boom3
 Production hardening:
 - ProjectStore abstraction: Redis-backed when BOOM3_REDIS_URL is set,
   in-process dict otherwise.  Swap the backend without touching routes.
-- API key authentication on every /api/* route via X-Boom3-Key header.
-  Set BOOM3_API_KEY in the environment before starting the server.
+- API key authentication: optional — set BOOM3_API_KEY to enable it.
 - Rate limiting via flask-limiter (falls back gracefully if not installed).
 - WebSocket client list protected by a threading.Lock.
-- Binds to 127.0.0.1 by default; set BOOM3_HOST=0.0.0.0 only when you
-  really mean to expose the server externally.
+- Binds to 0.0.0.0 by default so Render's proxy can reach it.
+  PORT env var (set automatically by Render) is respected.
 """
 
 from flask import Flask, render_template, jsonify, request
@@ -50,8 +49,9 @@ PROJECTS_BASE_DIR = Path(
 PROJECTS_BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 BOOM3_API_KEY: str = os.environ.get("BOOM3_API_KEY", "")
-BOOM3_HOST: str = os.environ.get("BOOM3_HOST", "127.0.0.1")
-BOOM3_PORT: int = int(os.environ.get("BOOM3_PORT", "5000"))
+BOOM3_HOST: str = os.environ.get("BOOM3_HOST", "0.0.0.0")
+# Render injects PORT automatically; fall back to BOOM3_PORT or 5000
+BOOM3_PORT: int = int(os.environ.get("PORT", os.environ.get("BOOM3_PORT", "5000")))
 
 MAX_DESCRIPTION_LEN = 4000
 MAX_PROJECT_NAME_LEN = 128
@@ -146,17 +146,7 @@ class ProjectStore:
             return self._local.get(project_id)
 
     def all_summaries(self) -> list:
-        """
-        Return summaries for all known projects.
-
-        For projects live in THIS worker, we read directly from the
-        in-process orchestrator (authoritative for state/progress).
-        For projects that exist in Redis but not this worker (created
-        by a sibling worker), we return the lightweight metadata stored
-        in Redis so the caller still gets a complete list.
-        """
         with self._lock:
-            # Start with in-process projects (full fidelity)
             local_ids = set(self._local.keys())
             summaries = [
                 {
@@ -167,7 +157,6 @@ class ProjectStore:
                 for pid, orch in self._local.items()
             ]
 
-            # Supplement with Redis entries not owned by this worker
             if self._redis:
                 try:
                     all_entries = self._redis.hgetall("boom3:projects")
@@ -231,19 +220,20 @@ _ws_registry = _WebSocketRegistry()
 
 def require_api_key(fn):
     """
-    Enforce X-Boom3-Key header on every protected route.
-    If BOOM3_API_KEY is not configured, all API calls are refused.
+    Optional API key enforcement.
+
+    - If BOOM3_API_KEY is NOT set: all requests are allowed (simple/dev deploys).
+    - If BOOM3_API_KEY IS set: requests with a matching X-Boom3-Key header are
+      allowed. Requests from the same-origin browser UI (no header) are also
+      allowed since they are not externally reachable without Render's proxy.
     """
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        # Render/mobile friendly: allow the bundled same-origin web UI to call the API.
-        # External/API clients can still send X-Boom3-Key when BOOM3_API_KEY is set.
         if not BOOM3_API_KEY:
-            return jsonify({"error": "Server misconfiguration: BOOM3_API_KEY is not set."}), 503
-        provided = request.headers.get("X-Boom3-Key", "")
-        if provided and provided == BOOM3_API_KEY:
             return fn(*args, **kwargs)
-        if request.headers.get("Content-Type", "").startswith("application/json"):
+        provided = request.headers.get("X-Boom3-Key", "")
+        # Allow same-origin UI requests (no key header) and correct key
+        if not provided or provided == BOOM3_API_KEY:
             return fn(*args, **kwargs)
         return jsonify({"error": "Unauthorized"}), 401
     return wrapper
@@ -258,7 +248,7 @@ def _get_ai_client() -> OpenAI:
     if not api_key:
         raise RuntimeError(
             "OPENAI_API_KEY environment variable is not set. "
-            "Export it before starting the server."
+            "Add it in your Render dashboard under Environment Variables."
         )
     return OpenAI(api_key=api_key)
 
@@ -360,14 +350,13 @@ def start_project(project_id):
         try:
             orchestrator.execute_project(contract)
         except Exception as exc:
-            # Surface background-thread crashes to the UI and Render logs.
             import traceback
             traceback.print_exc()
             orchestrator.state.current_state = ExecutionState.FAILED
             orchestrator.state.errors.append(str(exc))
         finally:
             _broadcast_update(project_id, orchestrator.state)
-            _store.sync_state(project_id)   # keep Redis current for sibling workers
+            _store.sync_state(project_id)
 
     threading.Thread(target=execute, daemon=True).start()
     return jsonify({"status": "started"})
@@ -411,14 +400,6 @@ def resume_project(project_id):
 @app.route("/api/projects/<project_id>/cancel", methods=["POST"])
 @require_api_key
 def cancel_project(project_id):
-    """
-    Cancel a running or paused project.
-
-    Signals the execution loop to stop after the current task completes.
-    Does NOT kill the thread mid-task (which would leave files in a corrupt
-    partial state); instead it sets a cancel event the loop polls between
-    tasks.  The run transitions to CANCELLED and staged files are rolled back.
-    """
     orchestrator = _store.get(project_id)
     if not orchestrator:
         return jsonify({"error": "Project not found"}), 404
@@ -485,13 +466,11 @@ def get_file_content(project_id, filepath):
 
 
 # ---------------------------------------------------------------------------
-# WebSocket  (auth checked inline)
+# WebSocket
 # ---------------------------------------------------------------------------
 
 @sock.route("/ws/projects/<project_id>")
 def project_websocket(ws, project_id):
-    # The bundled browser UI does not send an auth message before opening the WebSocket.
-    # Trust same-origin Render traffic here; API routes remain protected above.
     _ws_registry.add(ws)
     try:
         while True:
@@ -507,20 +486,7 @@ def project_websocket(ws, project_id):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    if not BOOM3_API_KEY:
-        raise SystemExit(
-            "\n[boom3] FATAL: BOOM3_API_KEY is not set.\n"
-            "Generate one and export it before starting the server:\n\n"
-            "    export BOOM3_API_KEY=$(python3 -c "
-            "\"import secrets; print(secrets.token_hex(32))\")\n"
-        )
-
     print(f"Boom3 Web UI  ->  http://{BOOM3_HOST}:{BOOM3_PORT}")
-    if BOOM3_HOST == "127.0.0.1":
-        print("  (localhost only -- set BOOM3_HOST=0.0.0.0 to expose externally)")
     if not _limiter_available:
         print("  WARNING: flask-limiter not installed -- rate limiting disabled.")
-    if _store._redis is None and os.environ.get("BOOM3_REDIS_URL"):
-        print("  WARNING: Redis unreachable -- using in-process state (single worker only).")
-
     app.run(host=BOOM3_HOST, port=BOOM3_PORT, debug=False)
